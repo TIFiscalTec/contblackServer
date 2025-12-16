@@ -9,7 +9,7 @@ const TermosDeUso = sequelize.define('termosDeUso', {
     primaryKey: true
   },
   Versao: {
-    type: DataTypes.STRING,
+    type: DataTypes.INTEGER,
     allowNull: false
   },
   Conteudo: {

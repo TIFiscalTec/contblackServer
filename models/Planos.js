@@ -44,6 +44,14 @@ const Planos = sequelize.define('planos', {
         type: DataTypes.BOOLEAN,
         allowNull: false,
         defaultValue: true
+    },
+    qtdNfseMensalUsuario: {
+        type: DataTypes.INTEGER,
+        allowNull: true
+    },
+    qtdNfseMensalClarea: {
+        type: DataTypes.INTEGER,
+        allowNull: true
     }
 }, {
     tableName: 'planos',

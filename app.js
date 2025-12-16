@@ -1,4 +1,6 @@
 
+const { Parser } = require('json2csv');
+
 const express = require('express');
 const bcrypt = require('bcrypt');
 const http = require('http');
@@ -9,8 +11,12 @@ const cors = require('cors');
 const sendEmail = require('./utils/SendEmail');
 const axios = require('axios');
 const { Op } = require("sequelize");
+const multer = require("multer");
+const path = require("path");
 const { v4: uuidv4 } = require("uuid");
 const nodemailer = require("nodemailer");
+const FormData = require("form-data");
+const archiver = require('archiver');
 require('dotenv').config();
 
 
@@ -24,9 +30,8 @@ require('dotenv').config();
 // };
 
 const app = express();
-const PORT = 3001;
+const PORT = 3006;
 
-// Models
 const sequelize = require('./conn');
 const Usuario = require('./models/Usuarios');
 const Endereco = require('./models/Enderecos');
@@ -42,15 +47,38 @@ const Admins = require('./models/Admins');
 const PasswordResets = require("./models/PasswordResets");
 const Lead = require('./models/Leads');
 const Cancelamentos = require('./models/Cancelamentos');
+const PoliticaDePrivacidade = require('./models/PoliticaDePrivacidade');
+const Certificados = require('./models/Certificados');
+const Empresas = require('./models/Empresas');
+const Servicos = require('./models/Servico');
+const NotasFiscais = require('./models/NotasFiscais');
+
+const allowedOrigins = [
+	"https://contblack.com.br",
+	"https://www.contblack.com.br",
+	"https://admin.contblack.com.br",
+	"http://localhost:3000",
+	"http://localhost:3001",
+	"http://localhost:3002",
+];
+
+app.use(cors({
+	origin: function (origin, callback) {
+		if (!origin || allowedOrigins.includes(origin)) {
+			callback(null, true);
+		} else {
+			callback(new Error("Not allowed by CORS"));
+		}
+	},
+	methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+	allowedHeaders: ["Content-Type", "Authorization"],
+	credentials: true
+}));
 
 app.use(express.json());
-app.use(cors({
-	origin: "*",
-	methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-	allowedHeaders: ["Content-Type", "Authorization"]
-}));
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+app.use(express.urlencoded({ extended: false }));
+const publicDir = path.join(__dirname, "nfse");
+app.use("/arquivos", express.static(publicDir));
 
 const server = http.createServer(app);
 
@@ -65,8 +93,161 @@ const autenticarToken = (req, res, next) => {
 	});
 };
 
+// Configura onde e como salvar o arquivo
+const storage = multer.diskStorage({
+	destination: (req, file, cb) => {
+		cb(null, "uploads/"); // pasta onde o arquivo será salvo
+	},
+	filename: (req, file, cb) => {
+		cb(null, Date.now() + path.extname(file.originalname)); // nome único
+	},
+});
+
+// Cria o middleware de upload
+const upload = multer({ storage });
+
+
 app.get('/', async (req, res) => {
-	res.send("up")
+	console.log(`[START] GET / - params:`, req.params, '- query:', req.query);
+	res.send("up");
+	console.log(`[END] GET /`);
+});
+
+app.get('/download/pdf/:cnpj/:ano/:mes/:arquivo', (req, res) => {
+	const { cnpj, ano, mes, arquivo } = req.params;
+	const filePath = path.join(process.cwd(), "nfse", "pdf", cnpj, ano, mes, arquivo);
+
+	res.download(filePath, arquivo, (err) => {
+		if (err) {
+			console.error("Erro ao enviar arquivo para download:", err);
+			return res.status(404).send("Arquivo não encontrado");
+		}
+	});
+});
+
+
+app.post("/contblackWebHook", async (req, res) => {
+	try {
+		const body = req.body;
+		console.log("Webhook recebido:", body);
+
+		if (!body.idIntegracao) {
+			return res.status(400).json({ erro: "Campo idIntegracao ausente." });
+		}
+		if (!body.emissao) {
+			return res.status(400).json({ erro: "Campo emissao ausente." });
+		}
+
+		const [dia, mes, ano] = body.emissao.split("/");
+
+		const xmlDir = path.join(__dirname, "nfse", "xml", body.prestador, ano, mes);
+		const pdfDir = path.join(__dirname, "nfse", "pdf", body.prestador, ano, mes);
+		fs.mkdirSync(xmlDir, { recursive: true });
+		fs.mkdirSync(pdfDir, { recursive: true });
+
+		const downloadFile = async (url, dest) => {
+			try {
+				const response = await axios.get(url, {
+					responseType: "stream",
+					headers: { "x-api-key": process.env.PLUGNOTAS_API_KEY },
+				});
+				const writer = fs.createWriteStream(dest);
+				response.data.pipe(writer);
+				await new Promise((resolve, reject) => {
+					writer.on("finish", resolve);
+					writer.on("error", reject);
+				});
+				console.log(`Arquivo salvo: ${dest}`);
+			} catch (err) {
+				console.error(`Erro ao baixar arquivo de ${url}:`, err.message);
+			}
+		};
+
+		let relativeXmlPath = null;
+		let relativePdfPath = null;
+
+		if (body.situacao === "CONCLUIDO" || body.situacao === "CANCELADO") {
+			const numero = body.numeroNfse || body.numero || "sem-numero";
+
+			const prefix = body.situacao === "CANCELADO" ? "CANCELADA_" : "";
+
+			const xmlFileName = `${prefix}${numero}.xml`;
+			const pdfFileName = `${prefix}${numero}.pdf`;
+
+			const xmlPath = path.join(xmlDir, xmlFileName);
+			const pdfPath = path.join(pdfDir, pdfFileName);
+
+			relativeXmlPath = `/xml/${body.prestador}/${ano}/${mes}/${xmlFileName}`.replaceAll("\\", "/");
+			relativePdfPath = `/pdf/${body.prestador}/${ano}/${mes}/${pdfFileName}`.replaceAll("\\", "/");
+
+			if (body.xml) await downloadFile(body.xml, xmlPath);
+			if (body.pdf) await downloadFile(body.pdf, pdfPath);
+		}
+
+		await NotasFiscais.update(
+			{
+				numeroNota: body.numeroNfse || null,
+				status: body.situacao,
+				dadosNFSe: body,
+				caminhoXML: relativeXmlPath,
+				caminhoPDF: relativePdfPath,
+			},
+			{ where: { idIntegracao: body.idIntegracao } }
+		);
+
+		console.log(`Nota ${body.idIntegracao} atualizada com status ${body.situacao}`);
+		res.status(200).json({ mensagem: `Webhook recebido. Situação: ${body.situacao}` });
+
+	} catch (error) {
+		console.error("Erro ao processar webhook:", error);
+		res.status(500).json({ erro: "Falha ao processar webhook" });
+	}
+});
+
+app.get("/listarNotasFiscaisEmitidas", autenticarToken, async (req, res) => {
+	const notasFiscais = await NotasFiscais.findAll({
+		where: { idUsuario: req.usuario.id },
+	});
+	if (notasFiscais.length === 0) return res.send({ status: 400, mensagem: 'Nenhuma nota fiscal encontrada.' });
+	res.send({ status: 200, notasFiscais });
+});
+
+app.post("/cancelarNotaFiscal", autenticarToken, async (req, res) => {
+	const { idIntegracao } = req.body;
+
+	if (!idIntegracao) {
+		return res.status(400).send({ status: 400, mensagem: 'ID da nota fiscal é obrigatório.' });
+	}
+
+	const notaFiscal = await NotasFiscais.findOne({
+		where: { idIntegracao, idUsuario: req.usuario.id },
+	});
+	if (!notaFiscal) return res.send({ status: 400, mensagem: 'Nenhuma nota fiscal encontrada.' });
+
+	console.log("Nota Fiscal encontrada:", notaFiscal.dataValues.dadosNFSe.id);
+
+	const url = `${process.env.PLUGNOTAS_API_URL}/nfse/cancelar/${notaFiscal.dataValues.dadosNFSe.id}`;
+	const headers = {
+		"Content-Type": "application/json",
+		"x-api-key": process.env.PLUGNOTAS_API_KEY,
+	};
+	const body = {};
+
+	try {
+		const response = await axios.post(url, body, { headers });
+		console.log("Resposta do PlugNotas:", response.data);
+
+		await NotasFiscais.update(
+			{ status: 'Pedido de Cancelamento' },
+			{ where: { idIntegracao: notaFiscal.idIntegracao } }
+		);
+
+		res.send({ status: 200, mensagem: 'Solicitação de cancelamento recebida.' });
+	} catch (error) {
+
+		console.error("Erro ao cancelar nota fiscal:", error.response?.data || error.message);
+		res.status(500).send({ status: 500, mensagem: 'Erro ao cancelar nota fiscal.' });
+	}
 });
 
 app.get("/getUserByEmail/:email", autenticarToken, async (req, res) => {
@@ -105,20 +286,20 @@ app.post("/recuperarSenha", async (req, res) => {
 		});
 
 		const transporter = nodemailer.createTransport({
-			host: "mail.clareavital.com.br",
+			host: "mail.contblack.com.br",
 			port: 465,
 			secure: true,
 			auth: {
-				user: "clareavital@clareavital.com.br",
+				user: "contblack@contblack.com.br",
 				pass: process.env.EMAIL_PASS,
 			},
 		});
 
 		const link = `${process.env.URL_FRONTEND}/resetarSenha?token=${token}`;
 
-		// Envio do e-mail HTML diretamente aqui
+		// Envio do e-mail HTML
 		await transporter.sendMail({
-			from: '"Clarea Vital" <clareavital@clareavital.com.br>',
+			from: '"ContBlack" <contblack@contblack.com.br>',
 			to: email,
 			subject: "Recuperação de senha",
 			text: `Olá, ${user.Nome}. Clique no link para redefinir sua senha: ${link}`,
@@ -137,7 +318,7 @@ app.post("/recuperarSenha", async (req, res) => {
 							<table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
 								<tr>
 									<td align="center" style="background-color: #0b243d; padding: 20px;">
-										<h1 style="color: #ffffff; margin: 0; font-size: 24px;">Clarea Vital</h1>
+										<h1 style="color: #ffffff; margin: 0; font-size: 24px;">Contblack</h1>
 									</td>
 								</tr>
 								<tr>
@@ -148,12 +329,12 @@ app.post("/recuperarSenha", async (req, res) => {
 											<a href="${link}" target="_blank" style="background-color: #0b243d; color: #ffffff; padding: 12px 24px; text-decoration: none; font-size: 16px; border-radius: 5px; display: inline-block;">Redefinir Senha</a>
 										</p>
 										<p>Se você não solicitou a redefinição da senha, pode ignorar este e-mail com segurança.</p>
-										<p style="margin-top: 20px;">Atenciosamente,<br><strong>Equipe Clarea Vital</strong></p>
+										<p style="margin-top: 20px;">Atenciosamente,<br><strong>Equipe Contblack</strong></p>
 									</td>
 								</tr>
 								<tr>
 									<td align="center" style="background-color: #f4f4f4; padding: 15px; font-size: 12px; color: #666666;">
-										<p>© ${new Date().getFullYear()} Clarea Vital. Todos os direitos reservados.</p>
+										<p>© ${new Date().getFullYear()} Contblack. Todos os direitos reservados.</p>
 									</td>
 								</tr>
 							</table>
@@ -170,8 +351,7 @@ app.post("/recuperarSenha", async (req, res) => {
 
 	} catch (error) {
 		console.error(error);
-		res.status(500).send({ mensagem: "Erro interno no servidor." });
-		console.log(`[END] POST /recuperarSenha - Erro interno.`);
+		return res.send({ status: 400, mensagem: "Algo deu errado." });
 	}
 });
 
@@ -248,7 +428,7 @@ app.post("/enviarEmail", async (req, res) => {
 		expiraEm,
 	});
 
-	const result = await sendEmail(email, "Assunto do E-mail", `Seu código de confirmação é:`, codigo);
+	const result = await sendEmail(email, "Contblack valide seu cadastro", `Seu código de confirmação é:`, codigo);
 
 	if (result.success) {
 		res.send({ status: 200, message: "E-mail enviado com sucesso!" });
@@ -267,11 +447,11 @@ app.post("/salvarLead", async (req, res) => {
 		let lead;
 
 		if (idLead) {
-			// 🔄 Atualiza se já existir
+			// Atualiza se já existir
 			lead = await Lead.findByPk(idLead);
 
 			if (lead) {
-				await lead.update({
+				await Lead.update({
 					nome: nome ?? lead.nome,
 					email: email ?? lead.email,
 					telefone: telefone ?? lead.telefone,
@@ -294,7 +474,7 @@ app.post("/salvarLead", async (req, res) => {
 				});
 			}
 		} else {
-			// 🆕 Cria novo lead
+			// Cria novo lead
 			lead = await Lead.create({
 				nome,
 				email,
@@ -370,6 +550,35 @@ app.get('/getDiscount', async (req, res) => {
 	}
 });
 
+app.post("/aplicarDesconto", autenticarToken, async (req, res) => {
+	try {
+		let { codigo } = req.body;
+
+		if (!codigo || codigo.trim() === "") {
+			return res.send({ mensagem: "Código de desconto inválido.", status: 400 });
+		}
+
+		codigo = codigo.trim().toUpperCase();
+		console.log("Código recebido:", codigo);
+
+		const desconto = await Descontos.findOne({
+			where: { status: true, discountCode: codigo }
+		});
+
+		if (!desconto) {
+			return res.send({ mensagem: "Desconto inválido.", status: 400 });
+		}
+
+		return res.send({
+			status: 200,
+			mensagem: "Desconto aplicado com sucesso.",
+			desconto
+		});
+	} catch (err) {
+		console.error("Erro ao aplicar desconto:", err);
+		return res.send({ mensagem: "Erro interno no servidor.", status: 400 });
+	}
+});
 
 
 app.post('/cadastro', async (req, res) => {
@@ -390,7 +599,7 @@ app.post('/cadastro', async (req, res) => {
 	// }
 
 	let idAsaas = "";
-	const url = 'https://api-sandbox.asaas.com/v3/customers';
+	const url = `${process.env.URL_ASAAS}/v3/customers`;
 	const headers = { 'accept': 'application/json', 'content-type': 'application/json', 'access_token': process.env.TOKEN_ASAAS };
 	const body = {
 		name: nome,
@@ -421,80 +630,94 @@ app.post('/cadastro', async (req, res) => {
 		console.log('Cliente criado no Asaas:', response.data);
 	} catch (error) {
 		console.error('Erro ao criar cliente no Asaas:', error.response?.data || error.message);
-		res.send({ status: 500, mensagem: 'Erro ao criar cliente no Asaas.' });
+		res.status(500).send({ status: 500, mensagem: 'Erro ao criar cliente no Asaas.' });
 	}
 
-	try {
-		// Busca o termo mais recente
-		const termoAtual = await TermosDeUso.findOne({ order: [['DataCriacao', 'DESC']] });
+	if (idAsaas) {
+		try {
+			// Busca o termo mais recente
+			const termoAtual = await TermosDeUso.findOne({ order: [['DataCriacao', 'DESC']] });
 
-		if (!termoAtual) {
-			return res.send({ status: 400, mensagem: 'Nenhum termo de uso cadastrado no sistema.' });
+			if (!termoAtual) {
+				return res.send({ status: 400, mensagem: 'Nenhum termo de uso cadastrado no sistema.' });
+			}
+			console.log('Termo atual:', termoAtual);
+
+			const politicaAtual = await PoliticaDePrivacidade.findOne({ order: [['DataCriacao', 'DESC']] });
+
+			if (!politicaAtual) {
+				return res.send({ status: 400, mensagem: 'Nenhuma política de privacidade cadastrada no sistema.' });
+			}
+
+			const senhaHash = await bcrypt.hash(senha, 10);
+			const usuario = await Usuario.create({
+				Nome: nome,
+				Email: email,
+				Senha: senhaHash,
+				TipoPessoa: tipoPessoa,
+				Cpf: cpf,
+				Cnpj: cnpj,
+				RazaoSocial: razaoSocial,
+				Telefone: telefone,
+				idAsaas: idAsaas,
+				TokenZapSign: "TokenZapSign"
+			});
+
+			if (!usuario) {
+				return res.send({ status: 400, mensagem: 'Erro ao cadastrar usuário.' });
+			}
+			console.log('Usuário cadastrado no banco de dados.');
+
+			const notificacao = await Notificacoes.create({
+				idUsuario: usuario.idUsuario,
+				titulo: 'Bem-vindo!',
+				descricao: 'Sua conta foi criada com sucesso.',
+				data: new Date()
+			});
+
+			if (!notificacao) {
+				return res.send({ status: 400, mensagem: 'Erro ao cadastrar notificação.' });
+			}
+
+			console.log('Notificação cadastrada no banco de dados.');
+
+			const enderecoResponse = await Endereco.create({
+				idUsuario: usuario.idUsuario,
+				Cep: cep,
+				Estado: estado,
+				Cidade: cidade,
+				Bairro: bairro,
+				Endereco: endereco,
+				Numero: numero,
+				Complemento: complemento
+			});
+
+			if (!enderecoResponse) {
+				return res.send({ status: 400, mensagem: 'Erro ao cadastrar endereço.' });
+			}
+
+			console.log('Endereço cadastrado no banco de dados.');
+
+			const consentimentoResponse = await Consentimento.create({
+				idUsuario: usuario.idUsuario,
+				idTermo: termoAtual.idTermo,
+				idPolitica: politicaAtual.idPolitica,
+				DataConcordancia: new Date(),
+				Revogado: false,
+				DataRevogacao: null
+			});
+
+			if (!consentimentoResponse) {
+				return res.send({ status: 400, mensagem: 'Erro ao registrar consentimento.' });
+			}
+
+			console.log('Consentimento registrado no banco de dados.');
+
+			res.send({ status: 200, mensagem: 'Usuário cadastrado e consentimento registrado.' });
+		} catch (err) {
+			res.send({ status: 400, mensagem: 'Erro ao cadastrar usuário e registrar consentimento.' });
 		}
-		console.log('Termo atual:', termoAtual);
-
-		const senhaHash = await bcrypt.hash(senha, 10);
-		const usuario = await Usuario.create({
-			Nome: nome,
-			Email: email,
-			Senha: senhaHash,
-			TipoPessoa: tipoPessoa,
-			Cpf: cpf,
-			Cnpj: cnpj,
-			RazaoSocial: razaoSocial,
-			Telefone: telefone,
-			idAsaas: idAsaas,
-			TokenZapSign: "TokenZapSign"
-		});
-
-		if (!usuario) {
-			return res.send({ status: 400, mensagem: 'Erro ao cadastrar usuário.' });
-		}
-		console.log('Usuário cadastrado no banco de dados.');
-
-		const notificacao = await Notificacoes.create({
-			idUsuario: usuario.idUsuario,
-			titulo: 'Bem-vindo!',
-			descricao: 'Sua conta foi criada com sucesso.',
-			data: new Date()
-		});
-
-		if (!notificacao) {
-			return res.send({ status: 400, mensagem: 'Erro ao cadastrar notificação.' });
-		}
-
-		console.log('Notificação cadastrada no banco de dados.');
-
-		const enderecoResponse = await Endereco.create({
-			idUsuario: usuario.idUsuario,
-			Cep: cep,
-			Estado: estado,
-			Cidade: cidade,
-			Bairro: bairro,
-			Endereco: endereco,
-			Numero: numero,
-			Complemento: complemento
-		});
-
-		if (!enderecoResponse) {
-			return res.send({ status: 400, mensagem: 'Erro ao cadastrar endereço.' });
-		}
-
-		console.log('Endereço cadastrado no banco de dados.');
-
-		const consentimentoResponse = await Consentimento.create({
-			idUsuario: usuario.idUsuario,
-			idTermo: termoAtual.idTermo
-		});
-
-		if (!consentimentoResponse) {
-			return res.send({ status: 400, mensagem: 'Erro ao registrar consentimento.' });
-		}
-
-		console.log('Consentimento registrado no banco de dados.');
-
-		res.send({ status: 200, mensagem: 'Usuário cadastrado e consentimento registrado.' });
-	} catch (err) {
+	} else {
 		res.send({ status: 400, mensagem: 'Erro ao cadastrar usuário e registrar consentimento.' });
 	}
 });
@@ -596,7 +819,7 @@ app.post("/criarAssinatura", autenticarToken, async (req, res) => {
 
 
 	const idAsaas = usuario.idAsaas;
-	const url = 'https://api-sandbox.asaas.com/v3/subscriptions';
+	const url = `${process.env.URL_ASAAS}/v3/subscriptions`;
 	const headers = {
 		'accept': 'application/json',
 		'content-type': 'application/json',
@@ -605,7 +828,7 @@ app.post("/criarAssinatura", autenticarToken, async (req, res) => {
 
 	const body = {
 		billingType: metodo,
-		cycle: periodicidade === "anual" ? 'YEARLY' : 'MONTHLY',
+		cycle: 'MONTHLY',
 		customer: idAsaas,
 		value: valor,
 		nextDueDate: nextDueDate,
@@ -616,7 +839,7 @@ app.post("/criarAssinatura", autenticarToken, async (req, res) => {
 		},
 		interest: { value: 0 },
 		fine: { value: 0, type: 'FIXED' },
-		description: titulo || 'Assinatura do Plano',
+		description: `CONTBLACK Assinatura do Plano - ${titulo}` || 'CONTBLACK Assinatura do Plano',
 		endDate: null,
 		maxPayments: null,
 		externalReference: null,
@@ -672,11 +895,14 @@ app.post("/criarAssinatura", autenticarToken, async (req, res) => {
 			idAssinaturaAsaas: response.data.id,
 			idAsaas: idAsaas,
 			status: response.data.status?.toUpperCase() || 'PENDENTE',
+			periodicidade: periodicidade === "mensal" ? "MENSAL" : "ANUAL",
 			dataInicio: new Date(),
 			dataFim: null,
 			proximaCobranca: response.data.nextDueDate || null,
 			ultimaCobranca: null
 		});
+
+		// let urlKommo = `${process.env.URL_KOMMO}/api/v4/leads/${usuario.idKommo}`;
 
 		return res.send({
 			status: 200,
@@ -688,6 +914,93 @@ app.post("/criarAssinatura", autenticarToken, async (req, res) => {
 			erro: 'Erro ao criar assinatura.'
 		});
 	}
+});
+
+
+app.post("/alterarMetodoPagamento", autenticarToken, async (req, res) => {
+	const { idAssinatura, idCustomer, value, description, nextDueDate, metodoPagamento, cardData } = req.body;
+
+	const usuario = await Usuario.findOne({ where: { idUsuario: req.usuario.id } });
+	const endereco = await Endereco.findOne({ where: { idUsuario: req.usuario.id } });
+
+	let url = `${process.env.URL_ASAAS}/v3/subscriptions`;
+	const headers = {
+		'accept': 'application/json',
+		'content-type': 'application/json',
+		'access_token': process.env.TOKEN_ASAAS
+	};
+
+	const body = {
+		billingType: metodoPagamento,
+		cycle: 'MONTHLY',
+		customer: idCustomer,
+		value: value,
+		nextDueDate: nextDueDate,
+		discount: {
+			value: 0,
+			dueDateLimitDays: 0,
+			type: 'PERCENTAGE'
+		},
+		interest: { value: 0 },
+		fine: { value: 0, type: 'FIXED' },
+		description: description || 'CONTBLACK Assinatura do Plano',
+
+		endDate: null,
+		maxPayments: null,
+		externalReference: null,
+		updatePendingPayments: true
+	};
+
+	if (metodoPagamento === 'CREDIT_CARD') {
+		if (!cardData) {
+			return res.send({ status: 400, erro: "Dados do cartão e do titular são obrigatórios para pagamento por cartão." });
+		}
+
+		const mes = cardData.expiry.slice(0, 2);
+		const ano = cardData.expiry.slice(3, 7);
+
+		body.creditCard = {
+			holderName: cardData.name,
+			number: cardData.number,
+			expiryMonth: mes,
+			expiryYear: ano,
+			ccv: cardData.cvv
+		};
+
+		body.creditCardHolderInfo = {
+			name: cardData.name,
+			email: usuario.Email,
+			cpfCnpj: usuario.Cpf || usuario.Cnpj,
+			postalCode: endereco.Cep,
+			addressNumber: endereco.Numero,
+			phone: usuario.Telefone
+		};
+	}
+
+	try {
+		const response = await axios.post(url, body, { headers });
+		console.log(response)
+		if (response.data && response.data.id) {
+			let urlDelete = `${process.env.URL_ASAAS}/v3/subscriptions/${idAssinatura}`;
+			const responseDelete = await axios.delete(urlDelete, { headers });
+			if (responseDelete.status === 200) {
+				Assinaturas.update({
+					idAssinaturaAsaas: response.data.id,
+					status: response.data.status?.toUpperCase() || 'PENDENTE',
+					metodoPagamento
+				}, {
+					where: {
+						idUsuario: req.usuario.id
+					}
+				});
+			}
+		}
+		res.send({ status: 200, data: response.data });
+	} catch (error) {
+		res.send({ status: 400, erro: 'Erro ao alterar método de pagamento.' });
+		console.error(error);
+	}
+
 });
 
 app.get("/hasPlan", autenticarToken, async (req, res) => {
@@ -707,20 +1020,28 @@ app.post("/buscarPlano", autenticarToken, async (req, res) => {
 	if (!plano) {
 		return res.send({ status: 400, mensagem: 'Plano não encontrado.' });
 	}
+	const usuario = await Usuario.findOne({ where: { idUsuario: id } });
 
-	const url = `https://api-sandbox.asaas.com/v3/subscriptions/${plano.idAssinaturaAsaas}/payments?status=RECEIVED`
+	const url = `${process.env.URL_ASAAS}/v3/payments?customer=${usuario.idAsaas}`;
+
 	const headers = {
-		accept: 'application/json',
-		access_token: process.env.TOKEN_ASAAS
-	}
+		'accept': 'application/json',
+		'access_token': process.env.TOKEN_ASAAS
+	};
 
 	const response = await axios.get(url, { headers });
 
-	if (!response) {
-		res.send({ status: 400, mensagem: 'Erro ao buscar pagamentos.' });
+	let pagas = [];
+
+	for (let fatura of response.data.data) {
+		const status = fatura.status;
+
+		if (['RECEIVED', 'RECEIVED_IN_CASH', 'CONFIRMED'].includes(status)) {
+			pagas.push(fatura);
+		}
 	}
 
-	const urlAssinatura = `https://api-sandbox.asaas.com/v3/subscriptions/${plano.idAssinaturaAsaas}`;
+	const urlAssinatura = `${process.env.URL_ASAAS}/v3/subscriptions/${plano.idAssinaturaAsaas}`;
 	const headersAssinatura = {
 		accept: 'application/json',
 		access_token: process.env.TOKEN_ASAAS
@@ -728,7 +1049,7 @@ app.post("/buscarPlano", autenticarToken, async (req, res) => {
 
 	const responseAssinatura = await axios.get(urlAssinatura, { headers: headersAssinatura });
 
-	res.send({ status: 200, pagamentos: response.data.data, assinatura: responseAssinatura.data });
+	res.send({ status: 200, pagamentos: pagas, assinatura: responseAssinatura.data });
 });
 
 app.post("/gerarContratoZapSign", autenticarToken, async (req, res) => {
@@ -740,7 +1061,7 @@ app.post("/gerarContratoZapSign", autenticarToken, async (req, res) => {
 		return res.send({ status: 400, mensagem: 'Usuário não encontrado.' });
 	}
 
-	const urlZapSign = `https://sandbox.api.zapsign.com.br/api/v1/docs/${process.env.TOKEN_CONTRATO_ZAPSIGN}/add-signer/`;
+	const urlZapSign = `${process.env.URL_ZAPSIGN}/api/v1/docs/${process.env.TOKEN_CONTRATO_ZAPSIGN}/add-signer/`;
 	const headersZapSign = {
 		'Content-Type': 'application/json',
 		'Authorization': `Bearer ${process.env.TOKEN_ZAPSIGN}`
@@ -781,7 +1102,7 @@ app.post("/getContrato", autenticarToken, async (req, res) => {
 		return res.send({ status: 400, mensagem: 'Contrato não encontrado.' });
 	}
 
-	const urlZapSign = `https://sandbox.api.zapsign.com.br/api/v1/signers/${response.dataValues.TokenZapSign}`;
+	const urlZapSign = `${process.env.URL_ZAPSIGN}/api/v1/signers/${response.dataValues.TokenZapSign}`;
 	const headersZapSign = {
 		'Content-Type': 'application/json',
 		'Authorization': `Bearer ${process.env.TOKEN_ZAPSIGN}`
@@ -871,7 +1192,7 @@ app.post("/mudarPlano/mudarPlano", autenticarToken, async (req, res) => {
 		return res.send({ status: 400, mensagem: 'Assinatura atual não encontrada.' });
 	}
 
-	const urlAssas = `https://api-sandbox.asaas.com/v3/subscriptions/${assinaturaAtual.idAssinaturaAsaas}`;
+	const urlAssas = `${process.env.URL_ASAAS}/v3/subscriptions/${assinaturaAtual.idAssinaturaAsaas}`;
 	const headersAssas = {
 		'accept': 'application/json',
 		'access_token': process.env.TOKEN_ASAAS,
@@ -879,6 +1200,7 @@ app.post("/mudarPlano/mudarPlano", autenticarToken, async (req, res) => {
 	};
 	const bodyAssas = {
 		value: plano.valorNovoMensal,
+		description: `CONTBLACK Assinatura do Plano - ${plano.nome}`,
 	}
 
 	const responseAssas = await axios.put(urlAssas, bodyAssas, { headers: headersAssas });
@@ -892,9 +1214,240 @@ app.post("/mudarPlano/mudarPlano", autenticarToken, async (req, res) => {
 	res.send({ status: 200, mensagem: 'Plano alterado com sucesso.' });
 });
 
+app.get("/getCertificado", autenticarToken, async (req, res) => {
+	const { id } = req.usuario;
+
+	const certificado = await Certificados.findOne({ where: { idUsuario: id } });
+	if (!certificado) {
+		return res.send({ status: 400, mensagem: 'Certificado não encontrado.' });
+	}
+	res.send({ status: 200, certificado });
+});
+
+app.post("/adicionarServico", autenticarToken, async (req, res) => {
+	const { codigo, codigoTributacao, discriminacao, cnae } = req.body;
+
+	const servico = await Servicos.create({
+		idUsuario: req.usuario.id,
+		codigo,
+		codigoTributacao,
+		discriminacao,
+		cnae,
+	});
+	if (!servico) {
+		return res.send({ status: 400, mensagem: 'Erro ao adicionar serviço.' });
+	}
+	res.send({ status: 200, mensagem: 'Serviço adicionado com sucesso.', servico });
+});
+
+app.get("/listarServicos", autenticarToken, async (req, res) => {
+	const servicos = await Servicos.findAll({ where: { idUsuario: req.usuario.id } });
+	if (!servicos) {
+		return res.send({ status: 400, mensagem: 'Nenhum serviço encontrado.' });
+	}
+	res.send({ status: 200, servicos });
+});
+
+app.get("/buscarServicoById/:idServico", autenticarToken, async (req, res) => {
+	const { idServico } = req.params;
+	const servico = await Servicos.findOne({ where: { idServico, idUsuario: req.usuario.id } });
+	if (!servico) {
+		return res.send({ status: 400, mensagem: 'Serviço não encontrado.' });
+	}
+	res.send({ status: 200, servico });
+});
+
+app.delete("/excluirServico/:idServico", autenticarToken, async (req, res) => {
+	const { idServico } = req.params;
+
+	const servico = await Servicos.findOne({ where: { idServico, idUsuario: req.usuario.id } });
+	if (!servico) {
+		return res.send({ status: 400, mensagem: 'Serviço não encontrado.' });
+	}
+
+	await Servicos.destroy({ where: { idServico } });
+	res.send({ status: 200, mensagem: 'Serviço deletado com sucesso.' });
+});
+
+app.put("/editarServico/:idServico", autenticarToken, async (req, res) => {
+	const { idServico } = req.params;
+	const { codigo, discriminacao, cnae } = req.body;
+
+	const servico = await Servicos.findOne({ where: { idServico, idUsuario: req.usuario.id } });
+	if (!servico) {
+		return res.send({ status: 400, mensagem: 'Serviço não encontrado.' });
+	}
+
+	await Servicos.update({
+		codigo,
+		codigoTributacao: codigo,
+		discriminacao,
+		cnae,
+	}, { where: { idServico } });
+
+	res.send({ status: 200, mensagem: 'Serviço atualizado com sucesso.' });
+});
+
+app.post("/emitirNotaServico", autenticarToken, async (req, res) => {
+	try {
+		const {
+			cpfCnpjTomador,
+			razaoSocialTomador,
+			emailTomador,
+			inscricaoMunicipalTomador,
+			cepTomador,
+			enderecoTomador,
+			numeroTomador,
+			estadoTomador,
+			cidadeTomador,
+			bairroTomador,
+			servicoSelecionado,
+			tipoTributacao,
+			exigibilidade,
+			aliquota,
+			valorServico,
+			descontoCondicionado,
+			descontoIncondicionado,
+			hasTomador,
+		} = req.body;
+
+		// Buscar a assinatura ativa do usuário
+		const assinatura = await Assinaturas.findOne({
+			where: { idUsuario: req.usuario.id, status: "ACTIVE" },
+			include: Planos,
+		});
+
+		if (!assinatura) return res.status(400).json({ error: "Assinatura ativa não encontrada." });
+
+		if (assinatura.dataValues.plano.dataValues.qtdNfseMensalUsuario !== -1) {
+			// Contar notas emitidas no mês atual
+			const hoje = new Date();
+			const primeiroDia = new Date(hoje.getFullYear(), hoje.getMonth(), 1);
+			const ultimoDia = new Date(hoje.getFullYear(), hoje.getMonth() + 1, 0);
+
+			const notasEsteMes = await NotasFiscais.count({
+				where: {
+					idUsuario: req.usuario.id,
+					emitidaPor: req.usuario.id,
+					dataEmissao: { [Op.between]: [primeiroDia, ultimoDia] },
+				},
+			});
+
+			if (notasEsteMes >= assinatura.dataValues.plano.dataValues.qtdNfseMensalUsuario) {
+				return res.send({ status: 400, error: "Limite de notas do mês atingido." });
+			}
+		}
+
+		// Buscar prestador
+		const prestador = await Empresas.findOne({ where: { idUsuario: req.usuario.id } });
+		if (!prestador) return res.status(404).json({ error: "Prestador não encontrado." });
+
+		const idIntegracao = Math.random().toString(36).substring(2, 15);
+		// Montar corpo da nota
+		const body = [];
+		if (hasTomador) {
+			// Buscar dados do CEP
+			let infoCep = false;
+			if (cepTomador) {
+				infoCep = await axios.get(`${process.env.PLUGNOTAS_API_URL}/cep/${cepTomador}`, {
+					headers: {
+						accept: "application/json",
+						"x-api-key": process.env.PLUGNOTAS_API_KEY,
+					},
+				});
+			}
+			body.push({
+				idIntegracao,
+				prestador: { cpfCnpj: prestador.dataValues.cnpj },
+				tomador: {
+					cpfCnpj: cpfCnpjTomador,
+					razaoSocial: razaoSocialTomador,
+					inscricaoMunicipal: inscricaoMunicipalTomador,
+					email: emailTomador,
+					endereco: {
+						descricaoCidade: cidadeTomador,
+						cep: cepTomador,
+						tipoLogradouro: enderecoTomador?.split(" ")[0],
+						logradouro: enderecoTomador?.slice(enderecoTomador.indexOf(" ") + 1),
+						tipoBairro: "",
+						codigoCidade: infoCep ? infoCep.data.ibge : "",
+						complemento: "",
+						estado: estadoTomador,
+						numero: numeroTomador,
+						bairro: bairroTomador,
+					},
+				},
+				servico: {
+					codigo: servicoSelecionado.codigo,
+					codigoTributacao: servicoSelecionado.codigo,
+					discriminacao: servicoSelecionado.discriminacao,
+					cnae: servicoSelecionado.cnae,
+					iss: {
+						tipoTributacao: tipoTributacao,
+						exigibilidade: exigibilidade,
+						aliquota: aliquota,
+					},
+					valor: {
+						servico: valorServico,
+						descontoCondicionado: descontoCondicionado || 0,
+						descontoIncondicionado: descontoIncondicionado || 0,
+					},
+				},
+				enviarEmail: true,
+			});
+		} else {
+			body.push({
+				idIntegracao,
+				prestador: { cpfCnpj: prestador.dataValues.cnpj },
+				servico: {
+					codigo: servicoSelecionado.codigo,
+					codigoTributacao: servicoSelecionado.codigo,
+					discriminacao: servicoSelecionado.discriminacao,
+					cnae: servicoSelecionado.cnae,
+					iss: {
+						tipoTributacao: tipoTributacao,
+						exigibilidade: exigibilidade,
+						aliquota: aliquota,
+					},
+					valor: {
+						servico: valorServico,
+						descontoCondicionado: descontoCondicionado || 0,
+						descontoIncondicionado: descontoIncondicionado || 0,
+					},
+				},
+				enviarEmail: true,
+			});
+		}
+		console.log("Corpo da requisição para PlugNotas:", JSON.stringify(body, null, 2));
+
+		// Enviar nota para PlugNotas
+		const url = `${process.env.PLUGNOTAS_API_URL}/nfse`;
+		const headers = { "Content-Type": "application/json", "x-api-key": process.env.PLUGNOTAS_API_KEY };
+		const response = await axios.post(url, body, { headers });
+
+		// Salvar no banco
+		await NotasFiscais.create({
+			idUsuario: req.usuario.id,
+			idIntegracao: idIntegracao,
+			idAssinatura: assinatura.idAssinatura,
+			emitidaPor: req.usuario.id,
+			dataEmissao: new Date(),
+			valor: valorServico,
+			status: "PENDENTE",
+			dadosNFSe: JSON.stringify(response.data) || null,
+		});
+
+		res.send({ status: 200, data: response.data });
+
+	} catch (error) {
+		console.error("Erro ao emitir NFS-e:", error);
+		if (error.response) return res.status(error.response.status).json(error.response.data);
+		res.send({ status: 400, error: "Erro interno ao emitir nota." });
+	}
+});
+
 app.post("/dashboard", autenticarToken, async (req, res) => {
 	const { email } = req.body;
-	console.log(email)
 
 	// verifica se o usuario usou desconto
 	const descontoUsado = await DescontosUsados.findOne({ where: { idUsuario: req.usuario.id } });
@@ -910,14 +1463,14 @@ app.post("/dashboard", autenticarToken, async (req, res) => {
 		if (agora > fim || desconto.status === false) {
 			const plano = await Planos.findOne({ where: { idPlano: assinatura.idPlano } });
 
-			const urlAssas = `https://api-sandbox.asaas.com/v3/subscriptions/${assinatura.idAssinaturaAsaas}`;
+			const urlAssas = `${process.env.URL_ASAAS}/v3/subscriptions/${assinatura.idAssinaturaAsaas}`;
 			const headersAssas = {
 				'accept': 'application/json',
 				'access_token': process.env.TOKEN_ASAAS,
 				'content-type': 'application/json'
 			};
 			const bodyAssas = {
-				value: plano.valorNovoMensal,
+				value: assinatura.periodicidade === "MENSAL" ? plano.valorNovoMensal : plano.valorNovoAnual,
 			}
 
 			const responseAssas = await axios.put(urlAssas, bodyAssas, { headers: headersAssas });
@@ -940,10 +1493,9 @@ app.post("/dashboard", autenticarToken, async (req, res) => {
 	}
 
 
-	//b4a113da-554b-41e1-b548-ed564a12409b token zapsign
 	const tokenZapSign = await Usuario.findOne({ where: { Email: email }, attributes: ["TokenZapSign"] });
 
-	const urlZapSign = `https://sandbox.api.zapsign.com.br/api/v1/signers/${tokenZapSign.dataValues.TokenZapSign}`;
+	const urlZapSign = `${process.env.URL_ZAPSIGN}/api/v1/signers/${tokenZapSign.dataValues.TokenZapSign}`;
 	const headersZapSign = {
 		'Content-Type': 'application/json',
 		'Authorization': `Bearer ${process.env.TOKEN_ZAPSIGN}`
@@ -965,13 +1517,43 @@ app.post("/dashboard", autenticarToken, async (req, res) => {
 
 	if (!endereco) return res.send({ status: 400, mensagem: 'Endereço não encontrado.' });
 
+	const servicos = await Servicos.findAll({ where: { idUsuario: usuario.idUsuario } });
+
+	if (!servicos) return res.send({ status: 400, mensagem: 'Serviços não encontrados.' });
+
+	let empresa = await Empresas.findOne({ where: { idUsuario: usuario.idUsuario } });
+	if (!empresa) empresa = false;
+
 	const assinaturas = await Assinaturas.findOne({ where: { idUsuario: usuario.idUsuario } });
 
 	if (!assinaturas) return res.send({ status: 400, mensagem: 'Assinaturas não encontradas.' });
 
+	// Contar notas emitidas no mês atual
+	const hoje = new Date();
+	const primeiroDia = new Date(hoje.getFullYear(), hoje.getMonth(), 1, 0, 0, 0, 0);
+	const ultimoDia = new Date(hoje.getFullYear(), hoje.getMonth() + 1, 0, 23, 59, 59, 999);
+
+	const notasEsteMes = await NotasFiscais.count({
+		where: {
+			idUsuario: req.usuario.id,
+			emitidaPor: req.usuario.id,
+			dataEmissao: { [Op.between]: [primeiroDia, ultimoDia] },
+		},
+	});
+
+	const notasEmitidas = await NotasFiscais.count({
+		where: {
+			idUsuario: req.usuario.id,
+		},
+	});
+
+	console.log(hoje);
+	console.log(primeiroDia);
+	console.log(ultimoDia);
+
 	const plano = await Planos.findOne({ where: { idPlano: assinaturas.idPlano } });
 
-	const url = `https://api-sandbox.asaas.com/v3/payments?customer=${usuario.idAsaas}`;
+	const url = `${process.env.URL_ASAAS}/v3/payments?customer=${usuario.idAsaas}`;
 
 	const headers = {
 		'accept': 'application/json',
@@ -992,7 +1574,14 @@ app.post("/dashboard", autenticarToken, async (req, res) => {
 		if (['RECEIVED', 'RECEIVED_IN_CASH', 'CONFIRMED'].includes(status)) {
 			pagas.push(fatura);
 		} else if (['PENDING', 'AWAITING_RISK_ANALYSIS'].includes(status)) {
-			pendentes.push(fatura);
+			let dataVencimento = new Date(fatura.dueDate);
+			let hoje = new Date();
+			let diferencaEmDias = Math.ceil((dataVencimento - hoje) / (1000 * 60 * 60 * 24)); // Cálculo da diferença em dias
+
+			// Se a fatura vencer em 10 dias ou menos, considera como pendente
+			if (diferencaEmDias <= 10) {
+				pendentes.push(fatura);
+			}
 		} else if (['OVERDUE', 'DUNNING_REQUESTED', 'DUNNING_RECEIVED'].includes(status)) {
 			vencidas.push(fatura);
 		} else if (['REFUNDED', 'REFUND_REQUESTED', 'REFUND_IN_PROGRESS'].includes(status)) {
@@ -1002,7 +1591,7 @@ app.post("/dashboard", autenticarToken, async (req, res) => {
 		}
 	}
 
-	const urlAssinaturaAsaas = `https://api-sandbox.asaas.com/v3/subscriptions/${assinaturas.dataValues.idAssinaturaAsaas}`
+	const urlAssinaturaAsaas = `${process.env.URL_ASAAS}/v3/subscriptions/${assinaturas.dataValues.idAssinaturaAsaas}`;
 
 	const headersAssinaturaAsaas = {
 		'accept': 'application/json',
@@ -1011,10 +1600,19 @@ app.post("/dashboard", autenticarToken, async (req, res) => {
 
 	const responseAssinaturaAsaas = await axios.get(urlAssinaturaAsaas, { headers: headersAssinaturaAsaas });
 
+	let certificado = false;
+	const responseCertificado = await Certificados.findOne({ where: { idUsuario: usuario.idUsuario } });
+	if (responseCertificado) {
+		certificado = responseCertificado.dataValues;
+	}
 	const objeto = {
 		usuario: usuario.dataValues,
 		assinatura: assinaturas.dataValues,
 		plano: plano.dataValues,
+		servicos: servicos,
+		empresa: empresa ? empresa.dataValues : false,
+		notasEmitidasEsteMes: notasEsteMes,
+		totalNotasEmitidas: notasEmitidas,
 		faturas: {
 			pagas,
 			pendentes,
@@ -1024,7 +1622,8 @@ app.post("/dashboard", autenticarToken, async (req, res) => {
 		},
 		zapSign: responseZapSign.data,
 		endereco: endereco.dataValues,
-		asaas: responseAssinaturaAsaas.data
+		asaas: responseAssinaturaAsaas.data,
+		certificado: certificado || false
 	};
 
 	res.send({ status: 200, objeto });
@@ -1082,7 +1681,7 @@ app.get("/listarPlanos", async (req, res) => {
 app.post("/cancelarAssinatura", autenticarToken, async (req, res) => {
 	const { idAssinaturaAsaas, motivosSelecionados, outroMotivo } = req.body;
 
-	const urlAssas = `https://api-sandbox.asaas.com/v3/subscriptions/${idAssinaturaAsaas}`;
+	const urlAssas = `${process.env.URL_ASAAS}/v3/subscriptions/${idAssinaturaAsaas}`;
 	const headersAssas = {
 		'accept': 'application/json',
 		'access_token': process.env.TOKEN_ASAAS
@@ -1112,10 +1711,374 @@ app.post("/cancelarAssinatura", autenticarToken, async (req, res) => {
 
 // requests ADM
 
+app.post("/salvarDadosEmpresaADM", autenticarToken, async (req, res) => {
+	const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
+	if (!adm) return res.send({ status: 403, erro: 'Acesso negado.' });
+
+	try {
+		const { objetoPlugNotas, idUsuario } = req.body;
+
+		const certificado = await Certificados.findOne({ where: { idUsuario: idUsuario } });
+		if (!certificado) {
+			return res.status(400).send({ mensagem: 'Certificado não encontrado. Faça o upload do certificado antes de salvar os dados da empresa.' });
+		}
+
+		objetoPlugNotas.certificado = certificado.dataValues.idCertificadoPlugNotas;
+
+		const hasEmpresa = await Empresas.findOne({ where: { idUsuario: idUsuario } });
+
+		const url = hasEmpresa
+			? `${process.env.PLUGNOTAS_API_URL}/empresa/${hasEmpresa.dataValues.cnpj}`
+			: `${process.env.PLUGNOTAS_API_URL}/empresa`;
+
+		const headers = {
+			'Content-Type': 'application/json',
+			'x-api-key': process.env.PLUGNOTAS_API_KEY
+		};
+
+		console.log("Enviando para PlugNotas:", JSON.stringify(objetoPlugNotas, null, 2));
+
+		const response = await axios({
+			method: hasEmpresa ? 'patch' : 'post',
+			url,
+			headers,
+			data: objetoPlugNotas
+		});
+
+		console.log("Retorno PlugNotas:", response.data);
+
+		if (response.status === 200 || response.status === 201) {
+			let objetoEmpresa = {
+				cnpj: objetoPlugNotas.cpfCnpj,
+				inscricaoEstadual: objetoPlugNotas.inscricaoEstadual,
+				inscricaoMunicipal: objetoPlugNotas.inscricaoMunicipal,
+				razaoSocial: objetoPlugNotas.razaoSocial,
+				nomeFantasia: objetoPlugNotas.nomeFantasia,
+				certificado: objetoPlugNotas.certificado,
+				simplesNacional: objetoPlugNotas.simplesNacional,
+				regimeTributario: objetoPlugNotas.regimeTributario,
+				incentivoFiscal: objetoPlugNotas.incentivoFiscal,
+				incentivadorCultural: objetoPlugNotas.incentivadorCultural,
+				regimeTributarioEspecial: objetoPlugNotas.regimeTributarioEspecial,
+				cep: objetoPlugNotas.endereco.cep,
+				tipoLogradouro: objetoPlugNotas.endereco.tipoLogradouro,
+				logradouro: objetoPlugNotas.endereco.logradouro,
+				numero: objetoPlugNotas.endereco.numero,
+				estado: objetoPlugNotas.endereco.estado,
+				cidade: objetoPlugNotas.endereco.descricaoCidade,
+				bairro: objetoPlugNotas.endereco.bairro,
+				email: objetoPlugNotas.email,
+				telefone: objetoPlugNotas.telefone.ddd + objetoPlugNotas.telefone.numero,
+				gerarFaturas: false
+			};
+
+			if (hasEmpresa) {
+				await Empresas.update(objetoEmpresa, { where: { idUsuario: idUsuario } });
+			} else {
+				await Empresas.create({ ...objetoEmpresa, idUsuario: idUsuario });
+			}
+		}
+
+		res.send({ status: 200, mensagem: 'Dados da empresa salvos com sucesso.', data: response.data });
+	}
+	catch (error) {
+		console.error("Erro ao salvar dados da empresa:", error.response?.data || error.message);
+		res.send({ status: 500, mensagem: 'Erro ao salvar dados da empresa.', detalhes: error.response?.data || error.message });
+	}
+});
+
+app.post("/emitirNotaServicoADM", autenticarToken, async (req, res) => {
+	const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
+	if (!adm) return res.send({ status: 403, erro: 'Acesso negado.' });
+	console.log(req.body)
+
+	try {
+		const {
+			cpfCnpjTomador,
+			razaoSocialTomador,
+			emailTomador,
+			inscricaoMunicipalTomador,
+			cepTomador,
+			enderecoTomador,
+			numeroTomador,
+			estadoTomador,
+			cidadeTomador,
+			bairroTomador,
+			servicoSelecionado,
+			tipoTributacao,
+			exigibilidade,
+			aliquota,
+			valorServico,
+			descontoCondicionado,
+			descontoIncondicionado,
+			hasTomador,
+			idUsuario
+		} = req.body;
+
+		// Buscar a assinatura ativa do usuário
+		const assinatura = await Assinaturas.findOne({
+			where: { idUsuario: idUsuario, status: "ACTIVE" },
+			include: Planos,
+		});
+
+		if (!assinatura) return res.send({ status: 400, error: "Assinatura ativa não encontrada." });
+
+		if (assinatura.dataValues.plano.dataValues.qtdNfseMensalClarea !== -1) {
+			// Contar notas emitidas no mês atual
+			const hoje = new Date();
+			const primeiroDia = new Date(hoje.getFullYear(), hoje.getMonth(), 1);
+			const ultimoDia = new Date(hoje.getFullYear(), hoje.getMonth() + 1, 0);
+
+			const notasEsteMes = await NotasFiscais.count({
+				where: {
+					idUsuario: req.usuario.id,
+					emitidaPor: {
+						[Op.ne]: req.usuario.id, // diferente do usuário atual
+					},
+					dataEmissao: {
+						[Op.between]: [primeiroDia, ultimoDia], // dentro do mês atual
+					},
+				},
+			});
+
+			if (notasEsteMes >= assinatura.dataValues.plano.dataValues.qtdNfseMensalClarea) {
+				return res.send({ status: 400, error: "Limite de notas do mês atingido." });
+			}
+		}
+
+		// Buscar prestador
+		const prestador = await Empresas.findOne({ where: { idUsuario: idUsuario } });
+		if (!prestador) return res.send({ status: 400, error: "Prestador não encontrado." });
+		console.log(prestador.dataValues);
+
+		const idIntegracao = Math.random().toString(36).substring(2, 15);
+		// Montar corpo da nota
+		const body = [];
+		if (hasTomador) {
+			// Buscar dados do CEP
+			const infoCep = await axios.get(`${process.env.PLUGNOTAS_API_URL}/cep/${cepTomador}`, {
+				headers: {
+					accept: "application/json",
+					"x-api-key": process.env.PLUGNOTAS_API_KEY,
+				},
+			});
+			body.push({
+				idIntegracao,
+				prestador: { cpfCnpj: prestador.dataValues.cnpj },
+				tomador: {
+					cpfCnpj: cpfCnpjTomador,
+					razaoSocial: razaoSocialTomador,
+					inscricaoMunicipal: inscricaoMunicipalTomador,
+					email: emailTomador,
+					endereco: {
+						descricaoCidade: cidadeTomador,
+						cep: cepTomador,
+						tipoLogradouro: enderecoTomador?.split(" ")[0],
+						logradouro: enderecoTomador?.slice(enderecoTomador.indexOf(" ") + 1),
+						tipoBairro: "",
+						codigoCidade: infoCep.data.ibge,
+						complemento: "",
+						estado: estadoTomador,
+						numero: numeroTomador,
+						bairro: bairroTomador,
+					},
+				},
+				servico: {
+					codigo: servicoSelecionado.codigo,
+					codigoTributacao: servicoSelecionado.codigo,
+					discriminacao: servicoSelecionado.discriminacao,
+					cnae: servicoSelecionado.cnae,
+					iss: {
+						tipoTributacao: tipoTributacao,
+						exigibilidade: exigibilidade,
+						aliquota: aliquota,
+					},
+					valor: {
+						servico: valorServico,
+						descontoCondicionado: descontoCondicionado || 0,
+						descontoIncondicionado: descontoIncondicionado || 0,
+					},
+				},
+				enviarEmail: true,
+			});
+		} else {
+			body.push({
+				idIntegracao,
+				prestador: { cpfCnpj: prestador.dataValues.cnpj },
+				servico: {
+					codigo: servicoSelecionado.codigo,
+					codigoTributacao: servicoSelecionado.codigo,
+					discriminacao: servicoSelecionado.discriminacao,
+					cnae: servicoSelecionado.cnae,
+					iss: {
+						tipoTributacao: tipoTributacao,
+						exigibilidade: exigibilidade,
+						aliquota: aliquota,
+					},
+					valor: {
+						servico: valorServico,
+						descontoCondicionado: descontoCondicionado || 0,
+						descontoIncondicionado: descontoIncondicionado || 0,
+					},
+				},
+				enviarEmail: true,
+			});
+		}
+
+		// Enviar nota para PlugNotas
+		const url = `${process.env.PLUGNOTAS_API_URL}/nfse`;
+		const headers = { "Content-Type": "application/json", "x-api-key": process.env.PLUGNOTAS_API_KEY };
+		const response = await axios.post(url, body, { headers });
+
+		// Salvar no banco
+		await NotasFiscais.create({
+			idUsuario: idUsuario,
+			idIntegracao: idIntegracao,
+			idAssinatura: assinatura.idAssinatura,
+			emitidaPor: req.usuario.id,
+			dataEmissao: new Date(),
+			valor: valorServico,
+			status: "PENDENTE",
+			dadosNFSe: JSON.stringify(response.data) || null,
+		});
+
+		res.send({ status: 200, data: response.data });
+
+	} catch (error) {
+		console.error("Erro ao emitir NFS-e:", error.response.data.error);
+		res.send({ status: 400, error: "Erro interno ao emitir nota." });
+	}
+});
+
+app.post("/adicionarServicoADM", autenticarToken, async (req, res) => {
+	const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
+	if (!adm) return res.send({ status: 403, erro: 'Acesso negado.' });
+
+	console.log(req.body)
+	const { codigo, discriminacao, cnae, idUsuario } = req.body;
+
+	console.log(idUsuario)
+	const servico = await Servicos.create({
+		idUsuario: idUsuario,
+		codigo,
+		codigoTributacao: codigo,
+		discriminacao,
+		cnae,
+	});
+	if (!servico) {
+		return res.send({ status: 400, mensagem: 'Erro ao adicionar serviço.' });
+	}
+	res.send({ status: 200, mensagem: 'Serviço adicionado com sucesso.', servico });
+});
+
+
+app.post("/uploadCertificadoADM", autenticarToken, upload.single("arquivo"), async (req, res) => {
+	const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
+	if (!adm) return res.send({ status: 403, erro: 'Acesso negado.' });
+
+
+	const arquivo = req.file;
+	const { senha, email, idUsuario } = req.body;
+	console.log(idUsuario)
+
+	if (!arquivo) return res.send({ status: 400, error: "Arquivo não enviado" });
+
+	try {
+		// Verifica se o usuário já possui certificado
+		const certificadoExistente = await Certificados.findOne({ where: { idUsuario: idUsuario } });
+		const possuiCertificado = !!certificadoExistente;
+
+		// Define a URL da API
+		const url = possuiCertificado
+			? `${process.env.PLUGNOTAS_API_URL}/certificado/5bf94e0a4adcc00c28871999`
+			: `${process.env.PLUGNOTAS_API_URL}/certificado`;
+
+		// Cria FormData
+		const formData = new FormData();
+		formData.append("arquivo", fs.createReadStream(arquivo.path));
+		formData.append("senha", senha);
+		formData.append("email", email);
+
+		// Faz upload (POST ou PUT)
+		const response = possuiCertificado
+			? await axios.put(url, formData, { headers: { ...formData.getHeaders(), "x-api-key": process.env.PLUGNOTAS_API_KEY } })
+			: await axios.post(url, formData, { headers: { ...formData.getHeaders(), "x-api-key": process.env.PLUGNOTAS_API_KEY } });
+
+		// Remove arquivo local
+		if (fs.existsSync(arquivo.path)) fs.unlinkSync(arquivo.path);
+		console.log(response.data);
+		if (response.status === 201) {
+			// Salva o certificado no banco
+
+			await Certificados.create({
+				idUsuario: idUsuario,
+				idCertificadoPlugNotas: response.data.data.id,
+				arquivoNome: arquivo.originalname,
+			});
+
+			return res.send({ status: 200, mensagem: "Certificado enviado e salvo com sucesso.", data: response.data });
+		} else if (response.status === 200) {
+			// Atualiza o certificado no banco
+			await Certificados.update(
+				{ idCertificadoPlugNotas: response.data.data.id, arquivoNome: arquivo.originalname },
+				{ where: { idUsuario: idUsuario } }
+			);
+			return res.send({ status: 200, mensagem: "Certificado atualizado e salvo com sucesso.", data: response.data, nomeArquivo: arquivo.originalname });
+		}
+
+		const hasEmpresa = await Empresas.findOne({ where: { idUsuario: idUsuario } });
+		if (hasEmpresa) {
+			await Empresas.update({ certificado: response.data.data.id }, { where: { idUsuario: idUsuario } });
+		}
+	} catch (error) {
+		console.error("Erro no envio:", error.response?.data || error.message);
+
+		// Garante remoção do arquivo mesmo em caso de erro
+		if (arquivo.path && fs.existsSync(arquivo.path)) fs.unlinkSync(arquivo.path);
+
+		return res.send({ status: 400, error: "Erro ao enviar certificado" });
+	}
+});
+
+app.get("/getInfoPerfilUsuario/:idUsuario", autenticarToken, async (req, res) => {
+	const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
+	if (!adm) return res.send({ status: 403, erro: 'Acesso negado.' });
+
+	const { idUsuario } = req.params;
+	// const idUsuario = 1; // temporario para testes
+
+	const usuario = await Usuario.findOne({ where: { idUsuario } });
+	if (!usuario) return res.send({ status: 400, erro: 'Usuário não encontrado.' });
+
+	const empresa = await Empresas.findOne({ where: { idUsuario } });
+	const servicos = await Servicos.findAll({ where: { idUsuario } });
+	const certificado = await Certificados.findOne({ where: { idUsuario } });
+	const plano = await Assinaturas.findOne({ where: { idUsuario }, include: Planos });
+	const notasEmitidasbyClarea = await NotasFiscais.count({
+		where: {
+			idUsuario: idUsuario,
+			emitidaPor: {
+				[Op.ne]: idUsuario, // diferente do idUsuario
+			},
+		},
+	});
+
+	const dados = {
+		usuario: usuario.dataValues,
+		empresa: empresa ? empresa.dataValues : false,
+		servicos: servicos.map(servico => servico.dataValues),
+		certificado: certificado ? certificado.dataValues : false,
+		assinatura: plano ? plano.dataValues : false,
+		notasEmitidasbyClarea
+	}
+
+	res.send({ status: 200, dados });
+});
+
 app.post("/verificarTokenAdmin", autenticarToken, async (req, res) => {
 	const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
 	if (!adm) return res.send({ status: 403, erro: 'Acesso negado.' });
-	
+
 	res.send({ status: 200, mensagem: 'Token válido.' });
 });
 
@@ -1141,6 +2104,187 @@ app.get('/leads/recuperaveis', async (req, res) => {
 	} catch (error) {
 		console.error(error);
 		res.status(500).json({ error: "Erro ao buscar leads recuperáveis" });
+	}
+});
+
+app.get("/buscarCnpj/:cnpj", autenticarToken, async (req, res) => {
+	const { cnpj } = req.params;
+	console.log("Buscando CNPJ:", cnpj);
+	const url = `${process.env.PLUGNOTAS_API_URL}/cnpj/${cnpj}`;
+	const headers = {
+		'Content-Type': 'application/json',
+		'x-api-key': process.env.PLUGNOTAS_API_KEY
+	};
+
+	try {
+		const response = await axios.get(url, { headers });
+		res.send({ status: 200, data: response.data });
+	} catch (error) {
+		console.error("Erro ao buscar CNPJ:", error.response ? error.response.data : error.message);
+		res.send({ status: 400, erro: 'Erro ao buscar CNPJ.' });
+	}
+});
+
+app.post("/salvarDadosEmpresa", autenticarToken, async (req, res) => {
+	try {
+		const { objetoPlugNotas, gerarFaturas } = req.body;
+
+		const certificado = await Certificados.findOne({ where: { idUsuario: req.usuario.id } });
+		if (!certificado) {
+			return res.status(400).send({ mensagem: 'Certificado não encontrado. Faça o upload do certificado antes de salvar os dados da empresa.' });
+		}
+
+		objetoPlugNotas.certificado = certificado.dataValues.idCertificadoPlugNotas;
+
+		const hasEmpresa = await Empresas.findOne({ where: { idUsuario: req.usuario.id } });
+
+		const url = hasEmpresa
+			? `${process.env.PLUGNOTAS_API_URL}/empresa/${hasEmpresa.dataValues.cnpj}`
+			: `${process.env.PLUGNOTAS_API_URL}/empresa`;
+
+		const headers = {
+			'Content-Type': 'application/json',
+			'x-api-key': process.env.PLUGNOTAS_API_KEY
+		};
+
+		console.log("Enviando para PlugNotas:", JSON.stringify(objetoPlugNotas, null, 2));
+
+		const response = await axios({
+			method: hasEmpresa ? 'patch' : 'post',
+			url,
+			headers,
+			data: objetoPlugNotas
+		});
+
+		console.log("Retorno PlugNotas:", response.data);
+
+		if (response.status === 200 || response.status === 201) {
+			let objetoEmpresa = {
+				cnpj: objetoPlugNotas.cpfCnpj,
+				inscricaoEstadual: objetoPlugNotas.inscricaoEstadual,
+				inscricaoMunicipal: objetoPlugNotas.inscricaoMunicipal,
+				razaoSocial: objetoPlugNotas.razaoSocial,
+				nomeFantasia: objetoPlugNotas.nomeFantasia,
+				certificado: objetoPlugNotas.certificado,
+				simplesNacional: objetoPlugNotas.simplesNacional,
+				regimeTributario: objetoPlugNotas.regimeTributario,
+				incentivoFiscal: objetoPlugNotas.incentivoFiscal,
+				incentivadorCultural: objetoPlugNotas.incentivadorCultural,
+				regimeTributarioEspecial: objetoPlugNotas.regimeTributarioEspecial,
+				cep: objetoPlugNotas.endereco.cep,
+				tipoLogradouro: objetoPlugNotas.endereco.tipoLogradouro,
+				logradouro: objetoPlugNotas.endereco.logradouro,
+				numero: objetoPlugNotas.endereco.numero,
+				estado: objetoPlugNotas.endereco.estado,
+				cidade: objetoPlugNotas.endereco.descricaoCidade,
+				bairro: objetoPlugNotas.endereco.bairro,
+				email: objetoPlugNotas.email,
+				telefone: objetoPlugNotas.telefone.ddd + objetoPlugNotas.telefone.numero,
+				gerarFaturas: gerarFaturas
+			};
+
+			if (hasEmpresa) {
+				await Empresas.update(objetoEmpresa, { where: { idUsuario: req.usuario.id } });
+			} else {
+				await Empresas.create({ ...objetoEmpresa, idUsuario: req.usuario.id });
+			}
+			if (gerarFaturas) {
+				const usuario = await Usuario.findByPk(req.usuario.id);
+				const urlAssas = `${process.env.URL_ASAAS}/v3/customers/${usuario.idAsaas}`;
+				const headersAssas = {
+					'accept': 'application/json',
+					'access_token': process.env.TOKEN_ASAAS,
+					'content-type': 'application/json'
+				};
+				const bodyAssas = {
+					cpfCnpj: objetoPlugNotas.cpfCnpj,
+				}
+				const responseAsaas = await axios.put(urlAssas, bodyAssas, { headers: headersAssas });
+				console.log("Retorno Asaas:", responseAsaas.data);
+			}
+		}
+
+		res.send({ status: 200, mensagem: 'Dados da empresa salvos com sucesso.', data: response.data });
+	}
+	catch (error) {
+		console.error("Erro ao salvar dados da empresa:", error.response?.data || error.message);
+		res.send({ status: 500, mensagem: 'Erro ao salvar dados da empresa.', detalhes: error.response?.data || error.message });
+	}
+});
+
+app.get("/getDadosEmpresa", autenticarToken, async (req, res) => {
+	try {
+		const empresa = await Empresas.findOne({ where: { idUsuario: req.usuario.id } });
+		if (!empresa) {
+			return res.send({ status: 400, data: {}, mensagem: 'Empresa não encontrada.' });
+		}
+		res.send({ status: 200, data: empresa });
+	} catch (error) {
+		console.error("Erro ao buscar dados da empresa:", error.message);
+		res.status(500).send({ status: 500, mensagem: 'Erro ao buscar dados da empresa.', detalhes: error.message });
+	}
+});
+
+app.post("/uploadCertificado", autenticarToken, upload.single("arquivo"), async (req, res) => {
+	const arquivo = req.file;
+	const { senha, email } = req.body;
+
+	if (!arquivo) return res.send({ status: 400, error: "Arquivo não enviado" });
+
+	try {
+		// Verifica se o usuário já possui certificado
+		const certificadoExistente = await Certificados.findOne({ where: { idUsuario: req.usuario.id } });
+		const possuiCertificado = !!certificadoExistente;
+
+		// Define a URL da API
+		const url = possuiCertificado
+			? `${process.env.PLUGNOTAS_API_URL}/certificado/5bf94e0a4adcc00c28871999`
+			: `${process.env.PLUGNOTAS_API_URL}/certificado`;
+
+		// Cria FormData
+		const formData = new FormData();
+		formData.append("arquivo", fs.createReadStream(arquivo.path));
+		formData.append("senha", senha);
+		formData.append("email", email);
+
+		// Faz upload (POST ou PUT)
+		const response = possuiCertificado
+			? await axios.put(url, formData, { headers: { ...formData.getHeaders(), "x-api-key": process.env.PLUGNOTAS_API_KEY } })
+			: await axios.post(url, formData, { headers: { ...formData.getHeaders(), "x-api-key": process.env.PLUGNOTAS_API_KEY } });
+
+		// Remove arquivo local
+		if (fs.existsSync(arquivo.path)) fs.unlinkSync(arquivo.path);
+		console.log(response.data);
+		if (response.status === 201) {
+			// Salva o certificado no banco
+
+			await Certificados.create({
+				idUsuario: req.usuario.id,
+				idCertificadoPlugNotas: response.data.data.id,
+				arquivoNome: arquivo.originalname,
+			});
+
+			return res.send({ status: 200, mensagem: "Certificado enviado e salvo com sucesso.", data: response.data });
+		} else if (response.status === 200) {
+			// Atualiza o certificado no banco
+			await Certificados.update(
+				{ idCertificadoPlugNotas: response.data.data.id, arquivoNome: arquivo.originalname },
+				{ where: { idUsuario: req.usuario.id } }
+			);
+			return res.send({ status: 200, mensagem: "Certificado atualizado e salvo com sucesso.", data: response.data, nomeArquivo: arquivo.originalname });
+		}
+
+		const hasEmpresa = await Empresas.findOne({ where: { idUsuario: req.usuario.id } });
+		if (hasEmpresa) {
+			await Empresas.update({ certificado: response.data.data.id }, { where: { idUsuario: req.usuario.id } });
+		}
+	} catch (error) {
+		console.error("Erro no envio:", error.response?.data || error.message);
+
+		// Garante remoção do arquivo mesmo em caso de erro
+		if (arquivo.path && fs.existsSync(arquivo.path)) fs.unlinkSync(arquivo.path);
+
+		return res.send({ status: 400, error: "Erro ao enviar certificado" });
 	}
 });
 
@@ -1194,11 +2338,11 @@ app.post("/recuperarSenhaAdmin", async (req, res) => {
 		});
 
 		const transporter = nodemailer.createTransport({
-			host: "mail.clareavital.com.br",
+			host: "mail.contblack.com.br",
 			port: 465,
 			secure: true,
 			auth: {
-				user: "clareavital@clareavital.com.br",
+				user: "contblack@contblack.com.br",
 				pass: process.env.EMAIL_PASS,
 			},
 		});
@@ -1207,7 +2351,7 @@ app.post("/recuperarSenhaAdmin", async (req, res) => {
 
 		// Envio do e-mail HTML diretamente aqui
 		await transporter.sendMail({
-			from: '"Clarea Vital" <clareavital@clareavital.com.br>',
+			from: '"Contblack" <contblack@contblack.com.br>',
 			to: email,
 			subject: "Recuperação de senha",
 			text: `Olá, ${user.Nome}. Clique no link para redefinir sua senha: ${link}`,
@@ -1226,7 +2370,7 @@ app.post("/recuperarSenhaAdmin", async (req, res) => {
 							<table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
 								<tr>
 									<td align="center" style="background-color: #0b243d; padding: 20px;">
-										<h1 style="color: #ffffff; margin: 0; font-size: 24px;">Clarea Vital</h1>
+										<h1 style="color: #ffffff; margin: 0; font-size: 24px;">Contblack</h1>
 									</td>
 								</tr>
 								<tr>
@@ -1237,12 +2381,12 @@ app.post("/recuperarSenhaAdmin", async (req, res) => {
 											<a href="${link}" target="_blank" style="background-color: #0b243d; color: #ffffff; padding: 12px 24px; text-decoration: none; font-size: 16px; border-radius: 5px; display: inline-block;">Redefinir Senha</a>
 										</p>
 										<p>Se você não solicitou a redefinição da senha, pode ignorar este e-mail com segurança.</p>
-										<p style="margin-top: 20px;">Atenciosamente,<br><strong>Equipe Clarea Vital</strong></p>
+										<p style="margin-top: 20px;">Atenciosamente,<br><strong>Equipe Contblack</strong></p>
 									</td>
 								</tr>
 								<tr>
 									<td align="center" style="background-color: #f4f4f4; padding: 15px; font-size: 12px; color: #666666;">
-										<p>© ${new Date().getFullYear()} Clarea Vital. Todos os direitos reservados.</p>
+										<p>© ${new Date().getFullYear()} Contblack. Todos os direitos reservados.</p>
 									</td>
 								</tr>
 							</table>
@@ -1340,6 +2484,42 @@ app.get("/listarUsuarios", autenticarToken, async (req, res) => {
 	}
 });
 
+
+app.get("/listarUsuariosEmitirNota", autenticarToken, async (req, res) => {
+	const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
+	if (!adm) return res.send({ status: 403, erro: "Acesso negado." });
+
+	try {
+		const usuarios = await Usuario.findAll({
+			include: [
+				{
+					model: Admins,
+					attributes: ["idAdmin"],
+					required: false,
+				},
+				{
+					model: Empresas,
+					as: "empresa", // se você definiu um alias no relacionamento, use aqui
+					required: false, // mesmo que o usuário possa não ter empresa
+				},
+			],
+			where: {
+				"$admin.idAdmin$": null,
+			},
+		});
+
+		if (usuarios.length > 0) {
+			res.send({ status: 200, usuarios });
+		} else {
+			res.send({ status: 400, erro: "Nenhum usuário não-admin encontrado." });
+		}
+	} catch (err) {
+		console.error(err);
+		res.status(500).send({ status: 500, erro: "Erro ao buscar usuários." });
+	}
+});
+
+
 app.get("/listarAdmins", autenticarToken, async (req, res) => {
 	const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
 	if (!adm) return res.send({ status: 403, erro: "Acesso negado." });
@@ -1386,12 +2566,27 @@ app.put("/atualizarPlano/:idPlano", autenticarToken, async (req, res) => {
 	if (!adm) return res.send({ status: 403, erro: 'Acesso negado.' });
 
 	const { idPlano } = req.params;
-	const { nomePlano, vlAntigo, vlNovo, percentual, descricao } = req.body;
+	const { nome,
+		valorAntigoMensal,
+		valorNovoMensal,
+		percentual,
+		descricao,
+		qtdNfseMensalUsuario,
+		qtdNfseMensalClarea
+	} = req.body;
 
 	const plano = await Planos.findOne({ where: { idPlano } });
 	if (!plano) return res.send({ status: 400, erro: 'Plano não encontrado.' });
 
-	const AtualizarPlano = await Planos.update({ nome: nomePlano, valorAntigoMensal: vlAntigo, valorNovoMensal: vlNovo, descontoMensal: parseInt(percentual), descricao }, { where: { idPlano } });
+	const AtualizarPlano = await Planos.update({
+		nome,
+		valorAntigoMensal,
+		valorNovoMensal,
+		descontoMensal: parseInt(percentual),
+		descricao,
+		qtdNfseMensalUsuario: parseInt(qtdNfseMensalUsuario),
+		qtdNfseMensalClarea: parseInt(qtdNfseMensalClarea)
+	}, { where: { idPlano } });
 
 	if (AtualizarPlano[0] === 1) {
 		res.send({ status: 200, mensagem: 'Plano atualizado com sucesso.' });
@@ -1412,19 +2607,81 @@ app.get("/listarTermos", autenticarToken, async (req, res) => {
 	}
 });
 
+app.get('/listarPoliticas', autenticarToken, async (req, res) => {
+	const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
+	if (!adm) return res.send({ status: 403, erro: 'Acesso negado.' });
+
+	const politicas = await PoliticaDePrivacidade.findAll();
+	if (politicas) {
+		res.send({ status: 200, politicas });
+	} else {
+		res.send({ status: 400, erro: 'Nenhuma política encontrada.' });
+	}
+})
+
+app.get("/get/termos-uso", async (req, res) => {
+	const termo = await TermosDeUso.findOne({
+		order: [['idTermo', 'DESC']]
+	});
+
+	if (termo) {
+		res.send({ status: 200, termo });
+	} else {
+		res.send({ status: 400, erro: 'Nenhum termo encontrado.' });
+	}
+});
+
+app.get("/get/politicas-privacidade", async (req, res) => {
+	const politica = await PoliticaDePrivacidade.findOne({
+		order: [['idPolitica', 'DESC']]
+	});
+
+	if (politica) {
+		res.send({ status: 200, politica });
+	} else {
+		res.send({ status: 400, erro: 'Nenhuma política encontrada.' });
+	}
+});
+
 app.post("/adicionarTermo", autenticarToken, async (req, res) => {
 	const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
 	if (!adm) return res.send({ status: 403, erro: 'Acesso negado.' });
 
-	const { conteudo, versao } = req.body;
+	const { content } = req.body;
 
-	const termos = await TermosDeUso.create({ Conteudo: conteudo, Versao: versao });
+	const termoMaisRecente = await TermosDeUso.findOne({
+		order: [['idTermo', 'DESC']]
+	});
+
+	let novaVersao = termoMaisRecente ? Number(termoMaisRecente.Versao) + 1 : 1;
+
+	const termos = await TermosDeUso.create({ Conteudo: content, Versao: novaVersao });
 
 	if (!termos) {
 		res.send({ status: 400, erro: 'Erro ao adicionar termo.' });
 	}
 
 	res.send({ status: 200, mensagem: 'Termo adicionado com sucesso.' });
+});
+
+app.post("/adicionarPolitica", autenticarToken, async (req, res) => {
+	const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
+	if (!adm) return res.send({ status: 403, erro: 'Acesso negado.' });
+
+	const { content } = req.body;
+
+	const politicaMaisRecente = await PoliticaDePrivacidade.findOne({
+		order: [['idPolitica', 'DESC']]
+	});
+	let novaVersao = politicaMaisRecente ? Number(politicaMaisRecente.Versao) + 1 : 1;
+
+	const politica = await PoliticaDePrivacidade.create({ Conteudo: content, Versao: novaVersao });
+
+	if (!politica) {
+		res.send({ status: 400, erro: 'Erro ao adicionar política.' });
+	}
+
+	res.send({ status: 200, mensagem: 'Política adicionada com sucesso.' });
 });
 
 app.get("/listarDescontos", autenticarToken, async (req, res) => {
@@ -1568,17 +2825,16 @@ app.get("/getDescontosUsados/:idDesconto", autenticarToken, async (req, res) => 
 
 	const { idDesconto } = req.params;
 
-	const response = await DescontosUsados.findAll(
-		{
-			include: [{
-				model: Descontos,
-				attributes: ["idDesconto", "discountCode", "valorDesconto"]
-			}, {
-				model: Usuario,
-				attributes: ["idUsuario", "Nome", "Email", "Telefone"]
-			}],
-			where: { idDesconto }
-		});
+	const response = await DescontosUsados.findAll({
+		include: [{
+			model: Descontos,
+			attributes: ["idDesconto", "discountCode", "valorDesconto"]
+		}, {
+			model: Usuario,
+			attributes: ["idUsuario", "Nome", "Email", "Telefone"]
+		}],
+		where: { idDesconto }
+	});
 	console.log(response)
 	if (response) {
 		res.send({ status: 200, descontosUsados: response });
@@ -1611,7 +2867,148 @@ app.get("/listarAssinaturas", autenticarToken, async (req, res) => {
 	}
 });
 
-sequelize.sync().then(() => {
+app.get("/download/pdf/:cnpj", async (req, res) => {
+	try {
+		const { cnpj } = req.params;
+
+		// Caminho da pasta desse CNPJ
+		const folderPath = path.join(process.cwd(), "nfse", "pdf", cnpj);
+
+		// Verifica se a pasta existe
+		if (!fs.existsSync(folderPath)) {
+			return res.status(404).send("❌ Pasta não encontrada.");
+		}
+
+		// Nome do arquivo ZIP final
+		const zipName = `notas_${cnpj}_PDF.zip`;
+
+		// Configura o cabeçalho HTTP para download
+		res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
+		res.setHeader("Content-Type", "application/zip");
+
+		// Cria o ZIP e envia direto para o response
+		const archive = archiver("zip", { zlib: { level: 9 } });
+		archive.pipe(res);
+
+		// Adiciona toda a pasta do CNPJ
+		archive.directory(folderPath, false);
+
+		// Finaliza o arquivo ZIP
+		await archive.finalize();
+
+		console.log(`📦 ZIP gerado e enviado: ${zipName}`);
+	} catch (error) {
+		console.error("🚨 Erro ao gerar ZIP:", error);
+		res.status(500).send("Erro ao gerar o arquivo ZIP.");
+	}
+});
+
+
+app.get("/download/xml/:cnpj", async (req, res) => {
+	try {
+		const { cnpj } = req.params;
+
+		// Caminho da pasta desse CNPJ
+		const folderPath = path.join(process.cwd(), "nfse", "xml", cnpj);
+
+		// Verifica se a pasta existe
+		if (!fs.existsSync(folderPath)) {
+			return res.status(404).send("❌ Pasta não encontrada.");
+		}
+
+		// Nome do arquivo ZIP final
+		const zipName = `notas_${cnpj}_XML.zip`;
+
+		// Configura o cabeçalho HTTP para download
+		res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
+		res.setHeader("Content-Type", "application/zip");
+
+		// Cria o ZIP e envia direto para o response
+		const archive = archiver("zip", { zlib: { level: 9 } });
+		archive.pipe(res);
+
+		// Adiciona toda a pasta do CNPJ
+		archive.directory(folderPath, false);
+
+		// Finaliza o arquivo ZIP
+		await archive.finalize();
+
+		console.log(`📦 ZIP gerado e enviado: ${zipName}`);
+	} catch (error) {
+		console.error("🚨 Erro ao gerar ZIP:", error);
+		res.status(500).send("Erro ao gerar o arquivo ZIP.");
+	}
+});
+
+app.post("/api/salvarDadosLead", async (req, res) => {
+	let { nome, email, telefone } = req.body;
+
+	try {
+		telefone = telefone.replace(/\D/g, "");
+
+		const alreadyExists = await Lead.findOne({ where: { email } });
+		if (alreadyExists) {
+			return res.status(400).send({ status: 400, mensagem: 'E-mail já cadastrado, entraremos em contato em breve.' });
+		}
+
+		await Lead.create({
+			nome,
+			email,
+			telefone,
+			stepAtual: 100
+		});
+		return res.status(200).send({ status: 200, mensagem: 'Lead salvo com sucesso.' });
+	} catch (error) {
+		console.error("Erro ao salvar lead:", error.message);
+		return res.status(500).send({ status: 500, mensagem: 'Ocorreu um erro, tente novamente mais tarde.', detalhes: error.message });
+	}
+});
+
+app.get("/api/listarLeads", autenticarToken, async (req, res) => {
+	const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
+	if (!adm) return res.send({ status: 403, erro: 'Acesso negado.' });
+	try {
+		const leads = await Lead.findAll({ where: { stepAtual: 100 } });
+		return res.send({ status: 200, leads });
+	} catch (error) {
+		console.error("Erro ao listar leads:", error.message);
+		return res.send({ status: 500, mensagem: 'Ocorreu um erro, tente novamente mais tarde.', detalhes: error.message });
+	}
+});
+
+app.get("/api/downloadCsv", autenticarToken, async (req, res) => {
+	try {
+		// Verifica se o usuário é admin
+		const adm = await Admins.findOne({ where: { idUsuario: req.usuario.id } });
+		if (!adm) return res.status(403).send({ status: 403, erro: "Acesso negado." });
+
+		// Busca os dados que você quer exportar
+		const leads = await Lead.findAll({
+			where: { stepAtual: 100 },
+			attributes: ["nome", "telefone", "email"]
+		});
+
+		if (!leads || leads.length === 0) {
+			return res.status(404).send({ status: 404, erro: "Nenhum lead encontrado." });
+		}
+
+		// Converte os dados para CSV
+		const jsonLeads = leads.map(lead => lead.toJSON());
+		const parser = new Parser();
+		const csv = parser.parse(jsonLeads);
+
+		// Configura o response para download
+		res.header("Content-Type", "text/csv");
+		res.attachment("leads.csv"); // nome do arquivo
+		return res.send(csv);
+
+	} catch (error) {
+		console.error(error);
+		res.status(500).send({ status: 500, erro: "Erro ao gerar CSV." });
+	}
+});
+
+sequelize.sync({ alter: true }).then(() => {
 	console.log('Tabelas sincronizadas com sucesso.');
 	server.listen(PORT, () => {
 		console.log(`Server is listening on port ${PORT}`);

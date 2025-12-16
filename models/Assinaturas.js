@@ -45,6 +45,11 @@ const Assinaturas = sequelize.define(
       allowNull: false,
       defaultValue: "PENDENTE",
     },
+    periodicidade: {
+      type: DataTypes.STRING(100),
+      allowNull: false,
+      defaultValue: "MENSAL",
+    },
     dataInicio: {
       type: DataTypes.DATE,
       allowNull: false,
@@ -60,6 +65,11 @@ const Assinaturas = sequelize.define(
     ultimaCobranca: {
       type: DataTypes.DATE,
       allowNull: true,
+    },
+    metodoPagamento: {
+      type: DataTypes.STRING(100),
+      allowNull: true,
+      defaultValue: "BOLETO"
     },
   },
   {
